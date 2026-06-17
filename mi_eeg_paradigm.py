@@ -9,19 +9,20 @@ ALL TIMING IS DRIVEN BY CROSS OVERLAPS.
 
 The second cross rotates continuously.  Every time it aligns with the
 fixed cross (every 90 deg of rotation) counts as one "overlap tick".
-The overlap period = 90 / rot_speed  seconds.
+The overlap period = tick_time  seconds  (rot_speed = 90/tick_time deg/s).
 
 Timeline of ONE TRIAL  (overlap ticks marked with |):
 
-   |--- n_pause ---|--- n_precue ---|--- n_mi ---|
-        PAUSE          FADE IN        MI + FADE OUT
-     (rest, just       (picture       (imagine! picture
-      the crosses)     fades in)      fades out)
+   [0 .. t_fadein)                fade IN   (precue trigger)
+   [t_fadein .. t_fadein+t_stay)  stay      (MI trigger)
+   [t_fadein+t_stay .. total)     fade OUT
+   n_pause ticks after fade-out:  pause, cross only (pause trigger)
 
-   ... then the cycle repeats for the next trial.
+   Before the first trial: n_cooldown ticks of just the crosses
+   so the participant can settle.
 
-   Triggers fire at the onset of each phase (first frame), class-specific
-   for precue and MI so you can epoch by condition.
+   Triggers fire at phase transitions, class-specific for precue and MI
+   so you can epoch by condition.
 
    n_runs  runs,  each with  n_repeats * 4 classes  trials.
 
@@ -35,23 +36,13 @@ HOW TO RUN
 EEG MARKERS
   trigger_backend:  'lsl' | 'parallel' | 'none' (CSV log only).
 ============================================================================
-
-I changed some variables in the code so keep them as they are now.
-
-CHANGES that need to be implemented:
-
--small picture mode each activity picture different cardinal direction left=left right=right rest=top feet=bottom
--Pictures flicker at the start should be smooth transition also fadein should start a changeable tickspace after overlap same for fade out
--Fade in should start 0.5 ticks after cossing then the picture should stay 0.5 ticks and fadeout the other 0.5 ticks (0 nothing 0.5 fadein(precue) 1 stay+MI 1.5 fadeout+MI) 2 pause 3 repeat)
--let the cross do n_cooldown ticks of nothing before starting so the participant can get ready
--what does the backend trigger do
--what are the markers? how does t_sec work?
-
-
 """
 
 from psychopy import visual, core, event, gui, monitors, logging
-import os, csv, random, datetime, math
+import os
+import csv
+import random
+import datetime
 
 logging.console.setLevel(logging.WARNING)
 
@@ -66,25 +57,27 @@ P = {
     'n_runs'          : 2,
     'n_repeats'       : 1,        # per class per run -> 4*10 = 40 trials/run
 
-    # --- timing (in overlap counts) ---
-    'n_pause'         : 1,         # overlap ticks of rest/pause
-    'n_precue'        : 1,         # overlap ticks for fade-in
-    'n_mi'            : 1,         # overlap ticks of MI (picture fades out)
+    # --- timing (all in overlap ticks; 1 tick = tick_time seconds) ---
+    # Trial: fade-in -> stay -> fade-out -> pause (cross only)
+    't_fadein'        : 0.5,       # ticks for picture to fade in
+    't_stay'          : 1.0,       # ticks picture stays fully visible
+    't_fadeout'       : 0.5,       # ticks for picture to fade out
+    'n_pause'         : 1,         # whole ticks of pause (cross only) after fade-out
+    'n_cooldown'      : 1,         # ticks of just-cross before first trial
 
     # --- cross appearance ---
     'cross_size'      : 0.25,      # half-length of each arm  (height units)
     'cross_thickness' : 0.003,     # half-width of each bar   (height units)
 
     # --- rotating cross ---
-    'rot_speed'       : 60.0,      # deg/s  (overlap period = 90/speed s)
+    'tick_time'       : 1.5,       # seconds per overlap tick  (rot_speed = 90/tick_time deg/s)
     'overlap_tol'     : 3.0,       # degrees for overlap detection
 
     # --- picture appearance ---
-    'bigpicture'      : True,     # True  = faint overlay;  False = small left
-    'overlay_opacity' : 0.35,      # peak opacity when bigpicture = True
-    'big_size'        : (0.6, 0.6),
-    'small_size'      : (0.45, 0.45),
-    'small_pos'       : (-0.35, 0.0),
+    'bigpicture'      : False,     # True  = faint overlay;  False = small cardinal positions
+    'overlay_opacity' : 0.20,      # peak opacity when bigpicture = True
+    'small_size'      : (0.225, 0.225),
+    # big_size and small_size are per-class; see BIG_SIZE / SMALL_SIZE below
 
     # --- hardware / display ---
     'fullscreen'      : True,
@@ -111,6 +104,30 @@ IMAGE_FILES = {
 }
 CLASSES  = ['rest', 'left', 'right', 'feet']
 
+# Cardinal positions for small-picture mode
+# rest=top, left=left, right=right, feet=bottom
+SMALL_POS = {
+    'rest'  : ( 0.00,  0.40),
+    'left'  : (-0.45,  0.00),
+    'right' : ( 0.45,  0.00),
+    'feet'  : ( 0.00, -0.40),
+}
+
+# Per-class display sizes (height units). left/right are 2:1 landscape.
+BIG_SIZE = {
+    'rest'  : (0.45, 0.45),
+    'left'  : (0.90, 0.45),
+    'right' : (0.90, 0.45),
+    'feet'  : (0.45, 0.45),
+}
+
+SMALL_SIZE = {
+    'rest'  : (0.225, 0.225),
+    'left'  : (0.450, 0.225),
+    'right' : (0.450, 0.225),
+    'feet'  : (0.225, 0.225),
+}
+
 TRIG = {
     'run_start': 250,
     'run_end'  : 251,
@@ -124,42 +141,51 @@ TRIG = {
 #  STARTUP DIALOG
 # ===========================================================================
 expinfo = {
-    'participant'     : P['participant'],
-    'session'         : P['session'],
-    'n_runs'          : P['n_runs'],
-    'n_repeats'       : P['n_repeats'],
-    'n_pause'         : P['n_pause'],
-    'n_precue'        : P['n_precue'],
-    'n_mi'            : P['n_mi'],
-    'rot_speed'       : P['rot_speed'],
-    'bigpicture'      : P['bigpicture'],
-    'fullscreen'      : P['fullscreen'],
-    'trigger_backend' : ['none', 'lsl', 'parallel'],
+    'participant'    : P['participant'],
+    'session'        : P['session'],
+    'n_runs'         : P['n_runs'],
+    'n_repeats'      : P['n_repeats'],
+    't_fadein'       : P['t_fadein'],
+    't_stay'         : P['t_stay'],
+    't_fadeout'      : P['t_fadeout'],
+    'n_pause'        : P['n_pause'],
+    'n_cooldown'     : P['n_cooldown'],
+    'tick_time'      : P['tick_time'],
+    'bigpicture'     : P['bigpicture'],
+    'avoid_repeats'  : P['avoid_repeats'],
+    'fullscreen'     : P['fullscreen'],
+    'trigger_backend': ['none', 'lsl', 'parallel'],
 }
 _order = ['participant', 'session', 'n_runs', 'n_repeats',
-          'n_pause', 'n_precue', 'n_mi', 'rot_speed',
-          'bigpicture', 'fullscreen', 'trigger_backend']
+          't_fadein', 't_stay', 't_fadeout', 'n_pause', 'n_cooldown', 'tick_time',
+          'bigpicture', 'avoid_repeats', 'fullscreen', 'trigger_backend']
 _dlg = gui.DlgFromDict(expinfo, title='MI EEG paradigm', order=_order)
 if not _dlg.OK:
     core.quit()
 P.update(expinfo)
 
 # --- force correct types (DlgFromDict returns strings) ---
-for k in ('n_runs', 'n_repeats', 'n_pause', 'n_precue', 'n_mi'):
+for k in ('n_runs', 'n_repeats', 'n_pause', 'n_cooldown'):
     P[k] = int(P[k])
-for k in ('rot_speed', 'overlap_tol', 'cross_size', 'cross_thickness',
+for k in ('tick_time', 't_fadein', 't_stay', 't_fadeout',
+          'overlap_tol', 'cross_size', 'cross_thickness',
           'overlay_opacity', 'lead_in'):
     P[k] = float(P[k])
 if isinstance(P['bigpicture'], str):
     P['bigpicture'] = P['bigpicture'] in ('True', 'true', '1')
+if isinstance(P['avoid_repeats'], str):
+    P['avoid_repeats'] = P['avoid_repeats'] in ('True', 'true', '1')
 if isinstance(P['fullscreen'], str):
     P['fullscreen'] = P['fullscreen'] in ('True', 'true', '1')
 
-overlap_period = 90.0 / P['rot_speed']   # seconds between overlaps
+overlap_period = float(P['tick_time'])          # seconds per overlap tick
+P['rot_speed']  = 90.0 / overlap_period         # deg/s used internally
+TICKS_PER_TRIAL = P['t_fadein'] + P['t_stay'] + P['t_fadeout'] + P['n_pause']
 print('[INFO] Overlap period = %.3f s' % overlap_period)
 print('[INFO] Trial duration = %d overlaps = %.1f s'
-      % (P['n_pause'] + P['n_precue'] + P['n_mi'],
-         (P['n_pause'] + P['n_precue'] + P['n_mi']) * overlap_period))
+      % (TICKS_PER_TRIAL, TICKS_PER_TRIAL * overlap_period))
+print('[INFO] Cooldown = %d overlaps = %.1f s'
+      % (P['n_cooldown'], P['n_cooldown'] * overlap_period))
 print('[INFO] Trials per run = %d,  runs = %d,  total = %d'
       % (4 * P['n_repeats'], P['n_runs'], 4 * P['n_repeats'] * P['n_runs']))
 
@@ -259,10 +285,14 @@ def wait_for_overlap():
     Returns immediately if we're already NOT overlapping and then enter."""
     # first make sure we leave any current overlap zone
     while _is_overlapping():
-        draw_scene(); flip(); check_quit()
+        draw_scene()
+        flip()
+        check_quit()
     # now wait to enter
     while not _is_overlapping():
-        draw_scene(); flip(); check_quit()
+        draw_scene()
+        flip()
+        check_quit()
 
 
 def show_text(msg, keys=('space',)):
@@ -298,79 +328,120 @@ def save_markers():
 #  TRIAL PHASES  (all overlap-counted)
 # ===========================================================================
 
-def phase_pause():
-    """Rest / pause: just the spinning crosses for n_pause overlaps."""
-    win.callOnFlip(trig.send, TRIG['pause'], 'pause')
-    for _ in range(P['n_pause']):
+def _wait_n_ticks(n):
+    """Wait for n overlap ticks (rising edges), drawing cross each frame."""
+    for _ in range(n):
         wait_for_overlap()
 
 
-def phase_precue(cls):
-    """Picture fades in over n_precue overlaps."""
-    peak = P['overlay_opacity'] if P['bigpicture'] else 1.0
+def phase_cooldown():
+    """Spin the crosses for n_cooldown ticks so the participant can get ready."""
+    win.callOnFlip(trig.send, TRIG['pause'], 'cooldown')
+    _wait_n_ticks(P['n_cooldown'])
+
+
+def _tick_time_frac():
+    """
+    Return a float in [0, 1] representing how far we are through the current
+    overlap tick, estimated from elapsed wall-clock time since last overlap.
+    Used for smooth sub-tick opacity interpolation.
+    """
+    # We track tick start time via a module-level variable updated each overlap.
+    elapsed = globalClock.getTime() - _tick_start[0]
+    return min(elapsed / overlap_period, 1.0) if overlap_period > 0 else 1.0
+
+
+# Module-level mutable for tick-start timestamp (avoids a global statement)
+_tick_start = [0.0]
+
+
+def _wait_for_overlap_tracked():
+    """Like wait_for_overlap() but records the tick-start time."""
+    while _is_overlapping():
+        draw_scene()
+        flip()
+        check_quit()
+    while not _is_overlapping():
+        draw_scene()
+        flip()
+        check_quit()
+    _tick_start[0] = globalClock.getTime()
+
+
+def run_trial(cls):
+    """
+    One full trial for class `cls`.
+
+    Picture timeline (all durations in ticks = multiples of tick_time seconds):
+      [0 .. t_fadein)              fade IN   (precue trigger at start)
+      [t_fadein .. t_fadein+t_stay) stay     (MI trigger at t_fadein)
+      [t_fadein+t_stay .. total)   fade OUT
+    Then waits for the next overlap and counts n_pause ticks (cross only).
+    """
+    peak      = P['overlay_opacity'] if P['bigpicture'] else 1.0
+    t_fi      = P['t_fadein']  * overlap_period   # seconds
+    t_st      = P['t_stay']    * overlap_period
+    t_fo      = P['t_fadeout'] * overlap_period
+    t_total   = t_fi + t_st + t_fo
+
     stim = _get_stim(cls)
-
-    win.callOnFlip(trig.send, TRIG['precue'][cls], 'precue_%s' % cls)
-
-    n = P['n_precue']
-    for i in range(n):
-        # opacity ramps linearly:  overlap 0 -> 1/n,  overlap n-1 -> n/n
-        op_start = peak * (i / n)
-        op_end   = peak * ((i + 1) / n)
-        # draw frames until the next overlap, interpolating opacity
-        t0 = globalClock.getTime()
-        dur_est = overlap_period          # approximate
-        while True:
-            was_in = _is_overlapping()
-            draw_scene(extra=stim, photodiode_on=True)
-            flip(); check_quit()
-            # interpolate opacity based on time within this overlap interval
-            elapsed = globalClock.getTime() - t0
-            frac = min(elapsed / dur_est, 1.0) if dur_est > 0 else 1.0
-            stim.opacity = op_start + (op_end - op_start) * frac
-            # detect next overlap (rising edge)
-            if not was_in and _is_overlapping():
-                break
-
-
-def phase_mi(cls):
-    """MI while picture fades out over n_mi overlaps."""
-    peak = P['overlay_opacity'] if P['bigpicture'] else 1.0
-    stim = _get_stim(cls)
-    stim.opacity = peak                   # start fully visible
-
-    win.callOnFlip(trig.send, TRIG['mi'][cls], 'mi_%s' % cls)
-
-    n = P['n_mi']
-    for i in range(n):
-        op_start = peak * (1.0 - i / n)
-        op_end   = peak * (1.0 - (i + 1) / n)
-        t0 = globalClock.getTime()
-        dur_est = overlap_period
-        while True:
-            was_in = _is_overlapping()
-            show_pic = stim.opacity > 0.01
-            draw_scene(extra=stim if show_pic else None, photodiode_on=show_pic)
-            flip(); check_quit()
-            elapsed = globalClock.getTime() - t0
-            frac = min(elapsed / dur_est, 1.0) if dur_est > 0 else 1.0
-            stim.opacity = op_start + (op_end - op_start) * frac
-            if not was_in and _is_overlapping():
-                break
     stim.opacity = 0.0
+
+    mi_fired = False
+
+    # wait for the next overlap tick, then start the picture clock
+    win.callOnFlip(trig.send, TRIG['precue'][cls], 'precue_%s' % cls)
+    _wait_for_overlap_tracked()
+    pic_clock = core.Clock()
+
+    # ---- Picture phase: runs for t_total seconds, frame by frame -------------
+    while True:
+        was_in = _is_overlapping()
+        elapsed = pic_clock.getTime()
+
+        if elapsed < t_fi:
+            stim.opacity = peak * (elapsed / t_fi) if t_fi > 0 else peak
+        elif elapsed < t_fi + t_st:
+            if not mi_fired:
+                win.callOnFlip(trig.send, TRIG['mi'][cls], 'mi_%s' % cls)
+                mi_fired = True
+            stim.opacity = peak
+        elif elapsed < t_total:
+            remaining = t_total - elapsed
+            stim.opacity = peak * (remaining / t_fo) if t_fo > 0 else 0.0
+        else:
+            stim.opacity = 0.0
+
+        show_pic = stim.opacity > 0.01
+        draw_scene(extra=stim if show_pic else None, photodiode_on=show_pic)
+        flip()
+        check_quit()
+
+        # once picture is done, wait for next overlap then hand off to pause
+        if elapsed >= t_total:
+            if not was_in and _is_overlapping():
+                _tick_start[0] = globalClock.getTime()
+                break
+
+    stim.opacity = 0.0
+
+    # ---- Pause ticks: cross only ----------------------------------------------
+    win.callOnFlip(trig.send, TRIG['pause'], 'pause')
+    _wait_n_ticks(P['n_pause'])
 
 
 def _get_stim(cls):
     """Return the image stim (or text placeholder) for a class, configured."""
+    pos = (0.0, 0.0) if P['bigpicture'] else SMALL_POS[cls]
     if IMG_STIMS[cls] is not None:
         stim = IMG_STIMS[cls]
-        stim.size = P['big_size'] if P['bigpicture'] else P['small_size']
-        stim.pos  = (0.0, 0.0) if P['bigpicture'] else P['small_pos']
+        stim.size = BIG_SIZE[cls] if P['bigpicture'] else SMALL_SIZE[cls]
+        stim.pos  = pos
     else:
         stim = placeholder
         stim.text   = cls.upper()
         stim.height = 0.15 if P['bigpicture'] else 0.09
-        stim.pos    = (0.0, 0.0) if P['bigpicture'] else P['small_pos']
+        stim.pos    = pos
     return stim
 
 
@@ -382,7 +453,8 @@ def _limit_runs(seq, max_run=2):
             if seq[i] == seq[i - 1]:
                 run += 1
                 if run > max_run:
-                    ok = False; break
+                    ok = False
+                    break
             else:
                 run = 1
         if ok:
@@ -391,11 +463,14 @@ def _limit_runs(seq, max_run=2):
     return seq
 
 
-def make_run_sequence():
+def make_run_sequence(prev_seq=None):
     seq = CLASSES * P['n_repeats']
-    random.shuffle(seq)
-    if P['avoid_repeats']:
-        seq = _limit_runs(seq, max_run=2)
+    for _ in range(1000):
+        random.shuffle(seq)
+        if P['avoid_repeats']:
+            seq = _limit_runs(seq, max_run=1)
+        if seq != prev_seq:
+            return seq
     return seq
 
 
@@ -411,8 +486,8 @@ frameClock  = core.Clock()
 MARKERS = []
 CUR = {'run': 0, 'trial': 0}
 
-fixation  = make_cross(P['fg_color'])
-rot_cross = make_cross(P['fg_color'])
+fixation  = make_cross([0.6, 0.6, 0.6])   # light grey
+rot_cross = make_cross([0.2, 0.2, 0.2])   # darker grey
 rot_cross.ori = 0.0
 
 placeholder = visual.TextStim(win, text='', color=P['fg_color'], height=0.1, units='height')
@@ -436,13 +511,14 @@ trig = TriggerBox(P['trigger_backend'], P['parallel_address'])
 
 if P['rng_seed'] is not None:
     random.seed(int(P['rng_seed']))
+else:
+    random.seed()  # force re-seed from os.urandom, overrides any app-level fixed seed
 
 
 # ===========================================================================
 #  MAIN
 # ===========================================================================
 try:
-    _ticks = P['n_pause'] + P['n_precue'] + P['n_mi']
     show_text(
         "Motor Imagery Experiment\n\n"
         "Keep your eyes on the cross in the centre.\n\n"
@@ -453,13 +529,25 @@ try:
         "Each trial = %d overlap ticks  (%.1f s)\n"
         "%d trials / run,  %d runs\n\n"
         "Press SPACE to begin."
-        % (_ticks, _ticks * overlap_period,
+        % (TICKS_PER_TRIAL, TICKS_PER_TRIAL * overlap_period,
            4 * P['n_repeats'], P['n_runs'])
     )
 
+    # --- one-time fade-in of the spinning cross over lead_in seconds ----------
+    rot_cross.opacity = 0.0
+    _fade_clock = core.Clock()
+    while _fade_clock.getTime() < P['lead_in']:
+        rot_cross.opacity = min(_fade_clock.getTime() / P['lead_in'], 1.0)
+        draw_scene()
+        flip()
+        check_quit()
+    rot_cross.opacity = 1.0
+
+    prev_seq = None
     for run in range(1, P['n_runs'] + 1):
         CUR['run'] = run
-        seq = make_run_sequence()
+        seq = make_run_sequence(prev_seq)
+        prev_seq = seq[:]
 
         if run > 1:
             show_text("Break.\n\nRun %d of %d coming up.\n\n"
@@ -468,17 +556,18 @@ try:
         globalClock.reset()
         frameClock.reset()
         win.callOnFlip(trig.send, TRIG['run_start'], 'run_start')
-        draw_scene(); flip()
-        core.wait(P['lead_in'])
+        draw_scene()
+        flip()
+
+        phase_cooldown()
 
         for i, cls in enumerate(seq, start=1):
             CUR['trial'] = i
-            phase_pause()
-            phase_precue(cls)
-            phase_mi(cls)
+            run_trial(cls)
 
         win.callOnFlip(trig.send, TRIG['run_end'], 'run_end')
-        draw_scene(); flip()
+        draw_scene()
+        flip()
         core.wait(0.3)
 
     show_text("All runs complete.\n\nThank you!\n\nPress SPACE to exit.")

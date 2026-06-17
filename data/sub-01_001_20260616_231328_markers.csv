@@ -1,6 +1,0 @@
-participant,session,run,trial,t_sec,code,label
-sub-01,001,1,0,0.0065,250,run_start
-sub-01,001,1,1,0.5076,30,pause
-sub-01,001,1,1,1.46456,12,precue_left
-sub-01,001,1,1,2.96481,22,mi_left
-sub-01,001,1,2,4.46453,30,pause
