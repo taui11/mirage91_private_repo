@@ -90,7 +90,7 @@ P = {
     'bg_color'        : 'black',
     'fg_color'        : 'white',
     'use_photodiode'  : False,
-    'trigger_backend' : 'none',    # 'none' | 'lsl' | 'parallel'
+    'trigger_backend' : 'lsl',    # 'none' | 'lsl' | 'parallel'
     'parallel_address': 0x0378,
 
     # --- misc ---
@@ -158,7 +158,7 @@ expinfo = {
     'bigpicture'     : P['bigpicture'],
     'avoid_repeats'  : P['avoid_repeats'],
     'fullscreen'     : P['fullscreen'],
-    'trigger_backend': ['none', 'lsl', 'parallel'],
+    'trigger_backend': ['lsl', 'none', 'parallel'],
 }
 _order = ['participant', 'session', 'n_runs', 'n_repeats',
           't_fadein', 't_stay', 't_fadeout', 'n_pause', 'n_cooldown', 'tick_time',
