@@ -1,6 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
+LABRECORDER stream finden
+Timing
+
+
 ============================================================================
  Motor-Imagery cue paradigm for EEG  --  PsychoPy (Coder / standalone .py)
 ============================================================================
