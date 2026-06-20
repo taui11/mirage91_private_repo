@@ -68,18 +68,21 @@ P = {
     't_fadeout'       : 0.5,       # ticks for picture to fade out
     'n_pause'         : 1,         # whole ticks of pause (cross only) after fade-out
     'n_cooldown'      : 1,         # ticks of just-cross before first trial
+    'fadein_gamma'    : 7.5,       # fade-in curve:  >1=slow start, 1=linear, <1=fast start
+    'fadeout_gamma'   : 0.75,       # fade-out curve: <1=stays bright then drops, 1=linear
 
     # --- cross appearance ---
     'cross_size'      : 0.25,      # half-length of each arm  (height units)
     'cross_thickness' : 0.003,     # half-width of each bar   (height units)
 
     # --- rotating cross ---
-    'tick_time'       : 1.5,       # seconds per overlap tick  (rot_speed = 90/tick_time deg/s)
+    'tick_time'       : 3.0,       # seconds per overlap tick  (rot_speed = 90/tick_time deg/s)
     'overlap_tol'     : 3.0,       # degrees for overlap detection
 
     # --- picture appearance ---
     'bigpicture'      : False,     # True  = faint overlay;  False = small cardinal positions
     'overlay_opacity' : 0.20,      # peak opacity when bigpicture = True
+    'small_opacity'   : 0.7,       # peak opacity when bigpicture = False
     'small_size'      : (0.225, 0.225),
     # big_size and small_size are per-class; see BIG_SIZE / SMALL_SIZE below
 
@@ -152,6 +155,8 @@ expinfo = {
     't_fadein'       : P['t_fadein'],
     't_stay'         : P['t_stay'],
     't_fadeout'      : P['t_fadeout'],
+    'fadein_gamma'   : P['fadein_gamma'],
+    'fadeout_gamma'  : P['fadeout_gamma'],
     'n_pause'        : P['n_pause'],
     'n_cooldown'     : P['n_cooldown'],
     'tick_time'      : P['tick_time'],
@@ -161,7 +166,8 @@ expinfo = {
     'trigger_backend': ['lsl', 'none', 'parallel'],
 }
 _order = ['participant', 'session', 'n_runs', 'n_repeats',
-          't_fadein', 't_stay', 't_fadeout', 'n_pause', 'n_cooldown', 'tick_time',
+          't_fadein', 't_stay', 't_fadeout', 'fadein_gamma', 'fadeout_gamma',
+          'n_pause', 'n_cooldown', 'tick_time',
           'bigpicture', 'avoid_repeats', 'fullscreen', 'trigger_backend']
 _dlg = gui.DlgFromDict(expinfo, title='MI EEG paradigm', order=_order)
 if not _dlg.OK:
@@ -171,7 +177,7 @@ P.update(expinfo)
 # --- force correct types (DlgFromDict returns strings) ---
 for k in ('n_runs', 'n_repeats', 'n_pause', 'n_cooldown'):
     P[k] = int(P[k])
-for k in ('tick_time', 't_fadein', 't_stay', 't_fadeout',
+for k in ('tick_time', 't_fadein', 't_stay', 't_fadeout', 'fadein_gamma', 'fadeout_gamma',
           'overlap_tol', 'cross_size', 'cross_thickness',
           'overlay_opacity', 'lead_in'):
     P[k] = float(P[k])
@@ -333,9 +339,9 @@ def save_markers():
 # ===========================================================================
 
 def _wait_n_ticks(n):
-    """Wait for n overlap ticks (rising edges), drawing cross each frame."""
+    """Wait for n overlap ticks, tracking the last one in _tick_start."""
     for _ in range(n):
-        wait_for_overlap()
+        _wait_for_overlap_tracked()
 
 
 def phase_cooldown():
@@ -382,7 +388,7 @@ def run_trial(cls):
       [t_fadein+t_stay .. total)   fade OUT
     Then waits for the next overlap and counts n_pause ticks (cross only).
     """
-    peak      = P['overlay_opacity'] if P['bigpicture'] else 1.0
+    peak      = P['overlay_opacity'] if P['bigpicture'] else P['small_opacity']
     t_fi      = P['t_fadein']  * overlap_period   # seconds
     t_st      = P['t_stay']    * overlap_period
     t_fo      = P['t_fadeout'] * overlap_period
@@ -393,26 +399,26 @@ def run_trial(cls):
 
     mi_fired = False
 
-    # wait for the next overlap tick, then start the picture clock
-    win.callOnFlip(trig.send, TRIG['precue'][cls], 'precue_%s' % cls)
-    _wait_for_overlap_tracked()
-    pic_clock = core.Clock()
+    # Picture clock starts from _tick_start, which was set by the last overlap
+    # of the previous pause/cooldown phase — no extra wait needed here.
+    trig.send(TRIG['precue'][cls], 'precue_%s' % cls)
+    t0 = _tick_start[0]
 
     # ---- Picture phase: runs for t_total seconds, frame by frame -------------
     while True:
-        was_in = _is_overlapping()
-        elapsed = pic_clock.getTime()
+        elapsed = globalClock.getTime() - t0
 
         if elapsed < t_fi:
-            stim.opacity = peak * (elapsed / t_fi) if t_fi > 0 else peak
+            t = (elapsed / t_fi) if t_fi > 0 else 1.0
+            stim.opacity = peak * (t ** P['fadein_gamma'])
         elif elapsed < t_fi + t_st:
             if not mi_fired:
-                win.callOnFlip(trig.send, TRIG['mi'][cls], 'mi_%s' % cls)
+                trig.send(TRIG['mi'][cls], 'mi_%s' % cls)
                 mi_fired = True
             stim.opacity = peak
         elif elapsed < t_total:
-            remaining = t_total - elapsed
-            stim.opacity = peak * (remaining / t_fo) if t_fo > 0 else 0.0
+            t = (t_total - elapsed) / t_fo if t_fo > 0 else 0.0
+            stim.opacity = peak * (t ** P['fadeout_gamma'])
         else:
             stim.opacity = 0.0
 
@@ -421,16 +427,15 @@ def run_trial(cls):
         flip()
         check_quit()
 
-        # once picture is done, wait for next overlap then hand off to pause
         if elapsed >= t_total:
-            if not was_in and _is_overlapping():
-                _tick_start[0] = globalClock.getTime()
-                break
+            break
 
     stim.opacity = 0.0
 
     # ---- Pause ticks: cross only ----------------------------------------------
-    win.callOnFlip(trig.send, TRIG['pause'], 'pause')
+    # _wait_n_ticks waits for n overlaps and tracks the last one in _tick_start,
+    # so the next trial's picture clock starts exactly from that overlap.
+    trig.send(TRIG['pause'], 'pause')
     _wait_n_ticks(P['n_pause'])
 
 
