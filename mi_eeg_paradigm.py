@@ -47,6 +47,7 @@ import os
 import csv
 import random
 import datetime
+import math
 
 logging.console.setLevel(logging.WARNING)
 
@@ -81,10 +82,20 @@ P = {
 
     # --- picture appearance ---
     'bigpicture'      : False,     # True  = faint overlay;  False = small cardinal positions
-    'overlay_opacity' : 0.20,      # peak opacity when bigpicture = True
+    'overlay_opacity' : 0.40,      # peak opacity when bigpicture = True
     'small_opacity'   : 0.7,       # peak opacity when bigpicture = False
     'small_size'      : (0.225, 0.225),
     # big_size and small_size are per-class; see BIG_SIZE / SMALL_SIZE below
+
+    # --- circle mode (third display mode: small cardinal pics + pulsing circle) ---
+    # Continuous cosine oscillation: r = r_max·cos²(π·t/T), T = TICKS_PER_TRIAL·tick_time.
+    # Static red ring at r_ring is always visible and marks the MI threshold.
+    # Images appear as precue when circle radius < r_precue, fully visible when < r_ring.
+    'circle_mode'     : False,   # True = circle/ring display replaces rotating cross
+    'circle_r_max'    : 0.20,    # max radius of moving circle (height units)
+    'circle_r_ring'   : 0.07,    # fixed ring radius (< r_max); marks MI onset
+    'circle_r_precue' : 0.13,    # image starts fading in when circle shrinks below this
+    'circle_line_w'   : 4,       # ring line width (pixels)
 
     # --- hardware / display ---
     'fullscreen'      : True,
@@ -161,6 +172,7 @@ expinfo = {
     'n_cooldown'     : P['n_cooldown'],
     'tick_time'      : P['tick_time'],
     'bigpicture'     : P['bigpicture'],
+    'circle_mode'    : P['circle_mode'],
     'avoid_repeats'  : P['avoid_repeats'],
     'fullscreen'     : P['fullscreen'],
     'trigger_backend': ['lsl', 'none', 'parallel'],
@@ -168,7 +180,7 @@ expinfo = {
 _order = ['participant', 'session', 'n_runs', 'n_repeats',
           't_fadein', 't_stay', 't_fadeout', 'fadein_gamma', 'fadeout_gamma',
           'n_pause', 'n_cooldown', 'tick_time',
-          'bigpicture', 'avoid_repeats', 'fullscreen', 'trigger_backend']
+          'bigpicture', 'circle_mode', 'avoid_repeats', 'fullscreen', 'trigger_backend']
 _dlg = gui.DlgFromDict(expinfo, title='MI EEG paradigm', order=_order)
 if not _dlg.OK:
     core.quit()
@@ -187,6 +199,8 @@ if isinstance(P['avoid_repeats'], str):
     P['avoid_repeats'] = P['avoid_repeats'] in ('True', 'true', '1')
 if isinstance(P['fullscreen'], str):
     P['fullscreen'] = P['fullscreen'] in ('True', 'true', '1')
+if isinstance(P['circle_mode'], str):
+    P['circle_mode'] = P['circle_mode'] in ('True', 'true', '1')
 
 overlap_period = float(P['tick_time'])          # seconds per overlap tick
 P['rot_speed']  = 90.0 / overlap_period         # deg/s used internally
@@ -280,10 +294,48 @@ def _is_overlapping():
     return ori < tol or ori > (90.0 - tol)
 
 
+def _draw_circle_scene():
+    """
+    Continuous cosine oscillation — no state machine.
+    One full cycle (BIG → gone → BIG) = one complete trial repetition
+    (t_fadein + t_stay + t_fadeout + n_pause ticks = TICKS_PER_TRIAL * overlap_period s).
+    Ring drawn on top so it stays visible in the foreground.
+    Phase anchored to _trial_t0 (set once per run to n_cooldown * overlap_period),
+    so the circle reaches r_max naturally when the first trial starts and completes
+    exactly one cycle per trial with no per-trial reset and no visible jumps.
+    """
+    stim = _circ_extra[0]
+    if stim is not None:
+        # Inside a trial: oscillate using the formula and draw stim via radius-based opacity.
+        # Drawn here so it persists smoothly into the pause phase without a forced cut.
+        t      = globalClock.getTime() - _trial_t0[0]
+        period = TICKS_PER_TRIAL * overlap_period
+        c      = math.cos(math.pi * t / period)
+        r      = P['circle_r_max'] * c * c
+        r_pc   = P['circle_r_precue']
+        r_rg   = P['circle_r_ring']
+        if r < r_pc:
+            stim.opacity = (_circ_peak[0] if r <= r_rg
+                            else _circ_peak[0] * (r_pc - r) / (r_pc - r_rg))
+            stim.draw()
+    else:
+        # Cooldown / lead-in / between runs: circle sits static at r_max.
+        # This avoids any phase-offset jump when transitioning into the first trial.
+        r = P['circle_r_max']
+
+    if r > 0.002:
+        breath_circle.radius = r
+        breath_circle.draw()               # grey filled circle on top of stim
+    mi_ring.draw()                         # ring always in foreground
+
+
 def draw_scene(extra=None, photodiode_on=False):
     advance_rotation()
-    fixation.draw()
-    rot_cross.draw()
+    if P['circle_mode']:
+        _draw_circle_scene()
+    else:
+        fixation.draw()
+        rot_cross.draw()
     if extra is not None:
         extra.draw()
     if P['use_photodiode'] and photodiode_on:
@@ -361,8 +413,11 @@ def _tick_time_frac():
     return min(elapsed / overlap_period, 1.0) if overlap_period > 0 else 1.0
 
 
-# Module-level mutable for tick-start timestamp (avoids a global statement)
-_tick_start = [0.0]
+# Module-level mutables (lists avoid global statements)
+_tick_start  = [0.0]
+_trial_t0    = [0.0]   # globalClock reference for circle oscillation (set once per run)
+_circ_extra  = [None]  # stim drawn by _draw_circle_scene during circle-mode trials
+_circ_peak   = [1.0]   # peak opacity for _circ_extra
 
 
 def _wait_for_overlap_tracked():
@@ -388,7 +443,7 @@ def run_trial(cls):
       [t_fadein+t_stay .. total)   fade OUT
     Then waits for the next overlap and counts n_pause ticks (cross only).
     """
-    peak      = P['overlay_opacity'] if P['bigpicture'] else P['small_opacity']
+    peak      = P['overlay_opacity'] if (P['bigpicture'] and not P['circle_mode']) else P['small_opacity']
     t_fi      = P['t_fadein']  * overlap_period   # seconds
     t_st      = P['t_stay']    * overlap_period
     t_fo      = P['t_fadeout'] * overlap_period
@@ -399,6 +454,13 @@ def run_trial(cls):
 
     mi_fired = False
 
+    if P['circle_mode']:
+        # Hand the stim to _draw_circle_scene so it keeps drawing it (with
+        # radius-based opacity) through the picture phase AND into the pause phase,
+        # giving a smooth natural fade-out instead of a forced cut.
+        _circ_extra[0] = stim
+        _circ_peak[0]  = peak
+
     # Picture clock starts from _tick_start, which was set by the last overlap
     # of the previous pause/cooldown phase — no extra wait needed here.
     trig.send(TRIG['precue'][cls], 'precue_%s' % cls)
@@ -408,48 +470,60 @@ def run_trial(cls):
     while True:
         elapsed = globalClock.getTime() - t0
 
-        if elapsed < t_fi:
-            t = (elapsed / t_fi) if t_fi > 0 else 1.0
-            stim.opacity = peak * (t ** P['fadein_gamma'])
-        elif elapsed < t_fi + t_st:
-            if not mi_fired:
-                trig.send(TRIG['mi'][cls], 'mi_%s' % cls)
-                mi_fired = True
-            stim.opacity = peak
-        elif elapsed < t_total:
-            t = (t_total - elapsed) / t_fo if t_fo > 0 else 0.0
-            stim.opacity = peak * (t ** P['fadeout_gamma'])
-        else:
-            stim.opacity = 0.0
+        # --- trigger timing: always tick-based ---
+        if elapsed >= t_fi and not mi_fired:
+            trig.send(TRIG['mi'][cls], 'mi_%s' % cls)
+            mi_fired = True
 
-        show_pic = stim.opacity > 0.01
-        draw_scene(extra=stim if show_pic else None, photodiode_on=show_pic)
+        if P['circle_mode']:
+            # Opacity and drawing handled entirely by _draw_circle_scene via _circ_extra
+            draw_scene()
+        else:
+            if elapsed < t_fi:
+                t = (elapsed / t_fi) if t_fi > 0 else 1.0
+                stim.opacity = peak * (t ** P['fadein_gamma'])
+            elif elapsed < t_fi + t_st:
+                stim.opacity = peak
+            elif elapsed < t_total:
+                t = (t_total - elapsed) / t_fo if t_fo > 0 else 0.0
+                stim.opacity = peak * (t ** P['fadeout_gamma'])
+            else:
+                stim.opacity = 0.0
+            show_pic = stim.opacity > 0.01
+            draw_scene(extra=stim if show_pic else None, photodiode_on=show_pic)
+
         flip()
         check_quit()
 
         if elapsed >= t_total:
             break
 
-    stim.opacity = 0.0
+    if not P['circle_mode']:
+        stim.opacity = 0.0
 
-    # ---- Pause ticks: cross only ----------------------------------------------
-    # _wait_n_ticks waits for n overlaps and tracks the last one in _tick_start,
-    # so the next trial's picture clock starts exactly from that overlap.
+    # ---- Pause ticks ---------------------------------------------------------
+    # In circle mode _draw_circle_scene keeps drawing the stim with radius-based
+    # opacity during these ticks, so the image fades out naturally as the circle
+    # grows back above r_precue.  After the ticks, clear the stim reference.
     trig.send(TRIG['pause'], 'pause')
     _wait_n_ticks(P['n_pause'])
+    if P['circle_mode']:
+        _circ_extra[0] = None
+        stim.opacity   = 0.0
 
 
 def _get_stim(cls):
     """Return the image stim (or text placeholder) for a class, configured."""
-    pos = (0.0, 0.0) if P['bigpicture'] else SMALL_POS[cls]
+    is_big = P['bigpicture'] and not P['circle_mode']
+    pos = (0.0, 0.0) if is_big else SMALL_POS[cls]
     if IMG_STIMS[cls] is not None:
         stim = IMG_STIMS[cls]
-        stim.size = BIG_SIZE[cls] if P['bigpicture'] else SMALL_SIZE[cls]
+        stim.size = BIG_SIZE[cls] if is_big else SMALL_SIZE[cls]
         stim.pos  = pos
     else:
         stim = placeholder
         stim.text   = cls.upper()
-        stim.height = 0.15 if P['bigpicture'] else 0.09
+        stim.height = 0.15 if is_big else 0.09
         stim.pos    = pos
     return stim
 
@@ -505,6 +579,14 @@ txt = visual.TextStim(win, text='', color=P['fg_color'], height=0.05,
 pd = visual.Rect(win, width=0.12, height=0.12, fillColor='white', lineColor='white',
                  pos=(0.78, -0.42), units='height')
 
+# circle-mode stims (used when P['circle_mode'] is True)
+breath_circle = visual.Circle(win, radius=0.05, fillColor=[0.6, 0.6, 0.6],
+                               lineColor=None, units='height')
+# static ring at r_ring — always visible in circle mode, marks the MI threshold
+mi_ring       = visual.Circle(win, radius=P['circle_r_ring'], fillColor=None,
+                               lineColor=[-0.3, -0.3, -0.3],  # dark grey
+                               lineWidth=P['circle_line_w'], units='height')
+
 IMAGE_PATHS, IMG_STIMS = {}, {}
 for c in CLASSES:
     p = os.path.join(P['images_dir'], IMAGE_FILES[c])
@@ -542,15 +624,26 @@ try:
            4 * P['n_repeats'], P['n_runs'])
     )
 
-    # --- one-time fade-in of the spinning cross over lead_in seconds ----------
+    # --- one-time fade-in of cross / circle over lead_in seconds ----------
     rot_cross.opacity = 0.0
+    if P['circle_mode']:
+        breath_circle.opacity = 0.0
+        mi_ring.opacity = 0.0
     _fade_clock = core.Clock()
     while _fade_clock.getTime() < P['lead_in']:
-        rot_cross.opacity = min(_fade_clock.getTime() / P['lead_in'], 1.0)
+        fade = min(_fade_clock.getTime() / P['lead_in'], 1.0)
+        if P['circle_mode']:
+            breath_circle.opacity = fade
+            mi_ring.opacity = fade
+        else:
+            rot_cross.opacity = fade
         draw_scene()
         flip()
         check_quit()
     rot_cross.opacity = 1.0
+    if P['circle_mode']:
+        breath_circle.opacity = 1.0
+        mi_ring.opacity = 1.0
 
     prev_seq = None
     for run in range(1, P['n_runs'] + 1):
@@ -564,6 +657,10 @@ try:
 
         globalClock.reset()
         frameClock.reset()
+        if P['circle_mode']:
+            # Offset so that globalClock.getTime() - _trial_t0[0] = 0 (→ r_max)
+            # when the cooldown finishes and trial 1 begins.
+            _trial_t0[0] = P['n_cooldown'] * overlap_period
         win.callOnFlip(trig.send, TRIG['run_start'], 'run_start')
         draw_scene()
         flip()
