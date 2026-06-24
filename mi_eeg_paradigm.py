@@ -1,34 +1,34 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-LABRECORDER stream finden
-Timing
-
-
 ============================================================================
  Motor-Imagery cue paradigm for EEG  --  PsychoPy (Coder / standalone .py)
 ============================================================================
 
-ALL TIMING IS DRIVEN BY CROSS OVERLAPS.
+TWO DISPLAY MODES (selected at startup):
 
-The second cross rotates continuously.  Every time it aligns with the
-fixed cross (every 90 deg of rotation) counts as one "overlap tick".
-The overlap period = tick_time  seconds  (rot_speed = 90/tick_time deg/s).
+  CROSS mode — timing driven by cross overlaps
+    The second cross rotates continuously. Every time it aligns with the
+    fixed cross (every 90 deg) counts as one "overlap tick".
+    overlap period = tick_time seconds.
 
-Timeline of ONE TRIAL  (overlap ticks marked with |):
+    Trial timeline:
+      [0 .. t_fadein)               fade IN    (precue trigger at start)
+      [t_fadein .. t_fadein+t_stay) stay       (MI trigger at t_fadein)
+      [t_fadein+t_stay .. total)    fade OUT
+      n_pause ticks of blank cross  (pause trigger at fade-out end)
+      n_cooldown ticks before first trial so participant can settle.
 
-   [0 .. t_fadein)                fade IN   (precue trigger)
-   [t_fadein .. t_fadein+t_stay)  stay      (MI trigger)
-   [t_fadein+t_stay .. total)     fade OUT
-   n_pause ticks after fade-out:  pause, cross only (pause trigger)
+  CIRCLE mode — continuous breathing circle
+    A circle oscillates r_max → 0 → r_max using a cosine curve.
+    Period = (t_fadein + t_stay + t_fadeout + n_pause) * tick_time seconds.
+    Images appear as the circle shrinks below r_precue, fully visible
+    inside r_ring. The circle never stops — n_pause is the "rest" portion
+    at the top of each breath. n_cooldown seconds of animated circle
+    play before the first trial.
 
-   Before the first trial: n_cooldown ticks of just the crosses
-   so the participant can settle.
-
-   Triggers fire at phase transitions, class-specific for precue and MI
-   so you can epoch by condition.
-
-   n_runs  runs,  each with  n_repeats * 4 classes  trials.
+  BIGPICTURE option (available for both modes):
+    Image is centred and large instead of small cardinal positions.
 
 HOW TO RUN
   1. Install PsychoPy  (standalone app, or  pip install psychopy).
@@ -37,8 +37,27 @@ HOW TO RUN
   3. PsychoPy Coder -> Open -> Run,  or  python mi_eeg_paradigm.py
   4. ESC to abort (markers saved).
 
-EEG MARKERS
-  trigger_backend:  'lsl' | 'parallel' | 'none' (CSV log only).
+EEG MARKERS  (trigger_backend: 'lsl' | 'parallel' | 'none')
+  Value  Label              When fired
+  -----  -----------------  ------------------------------------------------
+    250  run_start          First flip of each run (before cooldown)
+    251  run_end            First flip after last trial of each run
+
+     11  precue_rest  ]     At trial start — before image appears.
+     12  precue_left  ]     Epoch on these for condition-locked analysis.
+     13  precue_right ]
+     14  precue_feet  ]
+
+     21  mi_rest  ]         CROSS: when elapsed >= t_fadein (start of stay).
+     22  mi_left  ]         CIRCLE: first frame radius crosses r_ring inward.
+     23  mi_right ]         Use these as the MI onset marker for EEG epochs.
+     24  mi_feet  ]
+
+     30  pause              CROSS: immediately after fade-out, before blank ticks.
+                            CIRCLE: first frame radius crosses r_precue outward.
+                            Also sent once at cooldown start (before first trial).
+
+  All markers are also written to a CSV log regardless of trigger_backend.
 ============================================================================
 """
 
@@ -47,7 +66,6 @@ import os
 import csv
 import random
 import datetime
-import math
 
 logging.console.setLevel(logging.WARNING)
 
@@ -59,8 +77,8 @@ P = {
     # --- session ---
     'participant'     : 'sub-01',
     'session'         : '001',
-    'n_runs'          : 2,
-    'n_repeats'       : 1,        # per class per run -> 4*10 = 40 trials/run
+    'n_runs'          : 3,
+    'n_repeats'       : 10,        # per class per run -> 4*10 = 40 trials/run
 
     # --- timing (all in overlap ticks; 1 tick = tick_time seconds) ---
     # Trial: fade-in -> stay -> fade-out -> pause (cross only)
@@ -96,6 +114,7 @@ P = {
     'circle_r_ring'   : 0.07,    # fixed ring radius (< r_max); marks MI onset
     'circle_r_precue' : 0.13,    # image starts fading in when circle shrinks below this
     'circle_line_w'   : 4,       # ring line width (pixels)
+    'circle_opacity'  : 0.5,     # peak image opacity in circle mode
 
     # --- hardware / display ---
     'fullscreen'      : True,
@@ -110,7 +129,7 @@ P = {
     # --- misc ---
     'rng_seed'        : None,
     'images_dir'      : 'images',
-    'avoid_repeats'   : False,
+    'avoid_repeats'   : True,
     'lead_in'         : 0.5,
 }
 
@@ -156,9 +175,50 @@ TRIG = {
 
 
 # ===========================================================================
-#  STARTUP DIALOG
+#  STARTUP DIALOG  (two steps)
 # ===========================================================================
-expinfo = {
+
+# --- Step 1: display mode ---
+_dlg1_info = {
+    'cue_style'  : ['circle', 'cross'],
+    'bigpicture' : False,
+}
+_dlg1 = gui.DlgFromDict(_dlg1_info, title='MI EEG – Display Mode',
+                         order=['cue_style', 'bigpicture'])
+if not _dlg1.OK:
+    core.quit()
+P['circle_mode'] = (_dlg1_info['cue_style'] == 'circle')
+if isinstance(_dlg1_info['bigpicture'], str):
+    P['bigpicture'] = _dlg1_info['bigpicture'] in ('True', 'true', '1')
+else:
+    P['bigpicture'] = bool(_dlg1_info['bigpicture'])
+_mode_label = _dlg1_info['cue_style'] + (' + bigpicture' if P['bigpicture'] else '')
+
+# --- mode-specific defaults (overwrite P before dialog 2 reads it) ---
+_DEFAULTS_CROSS = {
+    't_fadein'     : 0.5,
+    't_stay'       : 1.0,
+    't_fadeout'    : 0.5,
+    'n_pause'      : 1,
+    'n_cooldown'   : 1,
+    'fadein_gamma' : 7.5,
+    'fadeout_gamma': 0.75,
+    'tick_time'    : 3.0,
+}
+_DEFAULTS_CIRCLE = {
+    't_fadein'     : 0.5,
+    't_stay'       : 1.0,
+    't_fadeout'    : 0.5,
+    'n_pause'      : 1,
+    'n_cooldown'   : 1,
+    'fadein_gamma' : 2.0,
+    'fadeout_gamma': 0.5,
+    'tick_time'    : 3.0,
+}
+P.update(_DEFAULTS_CIRCLE if P['circle_mode'] else _DEFAULTS_CROSS)
+
+# --- Step 2: session & timing parameters ---
+_dlg2_info = {
     'participant'    : P['participant'],
     'session'        : P['session'],
     'n_runs'         : P['n_runs'],
@@ -171,20 +231,21 @@ expinfo = {
     'n_pause'        : P['n_pause'],
     'n_cooldown'     : P['n_cooldown'],
     'tick_time'      : P['tick_time'],
-    'bigpicture'     : P['bigpicture'],
-    'circle_mode'    : P['circle_mode'],
     'avoid_repeats'  : P['avoid_repeats'],
     'fullscreen'     : P['fullscreen'],
     'trigger_backend': ['lsl', 'none', 'parallel'],
 }
-_order = ['participant', 'session', 'n_runs', 'n_repeats',
-          't_fadein', 't_stay', 't_fadeout', 'fadein_gamma', 'fadeout_gamma',
-          'n_pause', 'n_cooldown', 'tick_time',
-          'bigpicture', 'circle_mode', 'avoid_repeats', 'fullscreen', 'trigger_backend']
-_dlg = gui.DlgFromDict(expinfo, title='MI EEG paradigm', order=_order)
-if not _dlg.OK:
+_order2 = ['participant', 'session', 'n_runs', 'n_repeats',
+           't_fadein', 't_stay', 't_fadeout', 'fadein_gamma', 'fadeout_gamma',
+           'n_pause', 'n_cooldown', 'tick_time',
+           'avoid_repeats', 'fullscreen', 'trigger_backend']
+# circle mode: n_cooldown is in seconds not ticks (label stays the same)
+# cross mode: n_cooldown is tick-based — no difference in dialog, just semantics
+_dlg2 = gui.DlgFromDict(_dlg2_info, title='MI EEG – Settings  [mode: %s]' % _mode_label,
+                          order=_order2)
+if not _dlg2.OK:
     core.quit()
-P.update(expinfo)
+P.update(_dlg2_info)
 
 # --- force correct types (DlgFromDict returns strings) ---
 for k in ('n_runs', 'n_repeats', 'n_pause', 'n_cooldown'):
@@ -193,14 +254,10 @@ for k in ('tick_time', 't_fadein', 't_stay', 't_fadeout', 'fadein_gamma', 'fadeo
           'overlap_tol', 'cross_size', 'cross_thickness',
           'overlay_opacity', 'lead_in'):
     P[k] = float(P[k])
-if isinstance(P['bigpicture'], str):
-    P['bigpicture'] = P['bigpicture'] in ('True', 'true', '1')
 if isinstance(P['avoid_repeats'], str):
     P['avoid_repeats'] = P['avoid_repeats'] in ('True', 'true', '1')
 if isinstance(P['fullscreen'], str):
     P['fullscreen'] = P['fullscreen'] in ('True', 'true', '1')
-if isinstance(P['circle_mode'], str):
-    P['circle_mode'] = P['circle_mode'] in ('True', 'true', '1')
 
 overlap_period = float(P['tick_time'])          # seconds per overlap tick
 P['rot_speed']  = 90.0 / overlap_period         # deg/s used internally
@@ -294,45 +351,20 @@ def _is_overlapping():
     return ori < tol or ori > (90.0 - tol)
 
 
-def _draw_circle_scene():
-    """
-    Continuous cosine oscillation — no state machine.
-    One full cycle (BIG → gone → BIG) = one complete trial repetition
-    (t_fadein + t_stay + t_fadeout + n_pause ticks = TICKS_PER_TRIAL * overlap_period s).
-    Ring drawn on top so it stays visible in the foreground.
-    Phase anchored to _trial_t0 (set once per run to n_cooldown * overlap_period),
-    so the circle reaches r_max naturally when the first trial starts and completes
-    exactly one cycle per trial with no per-trial reset and no visible jumps.
-    """
-    stim = _circ_extra[0]
-    if stim is not None:
-        # Inside a trial: oscillate using the formula and draw stim via radius-based opacity.
-        # Drawn here so it persists smoothly into the pause phase without a forced cut.
-        t      = globalClock.getTime() - _trial_t0[0]
-        period = TICKS_PER_TRIAL * overlap_period
-        c      = math.cos(math.pi * t / period)
-        r      = P['circle_r_max'] * c * c
-        r_pc   = P['circle_r_precue']
-        r_rg   = P['circle_r_ring']
-        if r < r_pc:
-            stim.opacity = (_circ_peak[0] if r <= r_rg
-                            else _circ_peak[0] * (r_pc - r) / (r_pc - r_rg))
-            stim.draw()
-    else:
-        # Cooldown / lead-in / between runs: circle sits static at r_max.
-        # This avoids any phase-offset jump when transitioning into the first trial.
+def _draw_circle_scene(r=None):
+    """Draw the breathing circle at radius r (defaults to r_max = idle state)."""
+    if r is None:
         r = P['circle_r_max']
-
     if r > 0.002:
         breath_circle.radius = r
-        breath_circle.draw()               # grey filled circle on top of stim
-    mi_ring.draw()                         # ring always in foreground
+        breath_circle.draw()
+    mi_ring.draw()
 
 
-def draw_scene(extra=None, photodiode_on=False):
+def draw_scene(extra=None, photodiode_on=False, circle_r=None):
     advance_rotation()
     if P['circle_mode']:
-        _draw_circle_scene()
+        _draw_circle_scene(r=circle_r)
     else:
         fixation.draw()
         rot_cross.draw()
@@ -397,9 +429,21 @@ def _wait_n_ticks(n):
 
 
 def phase_cooldown():
-    """Spin the crosses for n_cooldown ticks so the participant can get ready."""
+    """Wait n_cooldown ticks (cross) or seconds (circle) before first trial."""
     win.callOnFlip(trig.send, TRIG['pause'], 'cooldown')
-    _wait_n_ticks(P['n_cooldown'])
+    if P['circle_mode']:
+        import math as _math
+        t_wait = P['n_cooldown'] * overlap_period
+        _clk = core.Clock()
+        while _clk.getTime() < t_wait:
+            elapsed = _clk.getTime()
+            phase = (elapsed / overlap_period) % 1.0
+            r = P['circle_r_max'] * 0.5 * (1.0 + _math.cos(2.0 * _math.pi * phase))
+            draw_scene(circle_r=r)
+            flip()
+            check_quit()
+    else:
+        _wait_n_ticks(P['n_cooldown'])
 
 
 def _tick_time_frac():
@@ -415,9 +459,6 @@ def _tick_time_frac():
 
 # Module-level mutables (lists avoid global statements)
 _tick_start  = [0.0]
-_trial_t0    = [0.0]   # globalClock reference for circle oscillation (set once per run)
-_circ_extra  = [None]  # stim drawn by _draw_circle_scene during circle-mode trials
-_circ_peak   = [1.0]   # peak opacity for _circ_extra
 
 
 def _wait_for_overlap_tracked():
@@ -443,7 +484,11 @@ def run_trial(cls):
       [t_fadein+t_stay .. total)   fade OUT
     Then waits for the next overlap and counts n_pause ticks (cross only).
     """
-    peak      = P['overlay_opacity'] if (P['bigpicture'] and not P['circle_mode']) else P['small_opacity']
+    if P['circle_mode']:
+        run_trial_circle(cls)
+        return
+
+    peak      = P['overlay_opacity'] if P['bigpicture'] else P['small_opacity']
     t_fi      = P['t_fadein']  * overlap_period   # seconds
     t_st      = P['t_stay']    * overlap_period
     t_fo      = P['t_fadeout'] * overlap_period
@@ -451,18 +496,8 @@ def run_trial(cls):
 
     stim = _get_stim(cls)
     stim.opacity = 0.0
-
     mi_fired = False
 
-    if P['circle_mode']:
-        # Hand the stim to _draw_circle_scene so it keeps drawing it (with
-        # radius-based opacity) through the picture phase AND into the pause phase,
-        # giving a smooth natural fade-out instead of a forced cut.
-        _circ_extra[0] = stim
-        _circ_peak[0]  = peak
-
-    # Picture clock starts from _tick_start, which was set by the last overlap
-    # of the previous pause/cooldown phase — no extra wait needed here.
     trig.send(TRIG['precue'][cls], 'precue_%s' % cls)
     t0 = _tick_start[0]
 
@@ -470,51 +505,107 @@ def run_trial(cls):
     while True:
         elapsed = globalClock.getTime() - t0
 
-        # --- trigger timing: always tick-based ---
         if elapsed >= t_fi and not mi_fired:
             trig.send(TRIG['mi'][cls], 'mi_%s' % cls)
             mi_fired = True
 
-        if P['circle_mode']:
-            # Opacity and drawing handled entirely by _draw_circle_scene via _circ_extra
-            draw_scene()
+        if elapsed < t_fi:
+            t = (elapsed / t_fi) if t_fi > 0 else 1.0
+            stim.opacity = peak * (t ** P['fadein_gamma'])
+        elif elapsed < t_fi + t_st:
+            stim.opacity = peak
+        elif elapsed < t_total:
+            t = (t_total - elapsed) / t_fo if t_fo > 0 else 0.0
+            stim.opacity = peak * (t ** P['fadeout_gamma'])
         else:
-            if elapsed < t_fi:
-                t = (elapsed / t_fi) if t_fi > 0 else 1.0
-                stim.opacity = peak * (t ** P['fadein_gamma'])
-            elif elapsed < t_fi + t_st:
-                stim.opacity = peak
-            elif elapsed < t_total:
-                t = (t_total - elapsed) / t_fo if t_fo > 0 else 0.0
-                stim.opacity = peak * (t ** P['fadeout_gamma'])
-            else:
-                stim.opacity = 0.0
-            show_pic = stim.opacity > 0.01
-            draw_scene(extra=stim if show_pic else None, photodiode_on=show_pic)
+            stim.opacity = 0.0
 
+        show_pic = stim.opacity > 0.01
+        draw_scene(extra=stim if show_pic else None, photodiode_on=show_pic)
         flip()
         check_quit()
 
         if elapsed >= t_total:
             break
 
-    if not P['circle_mode']:
-        stim.opacity = 0.0
+    stim.opacity = 0.0
 
-    # ---- Pause ticks ---------------------------------------------------------
-    # In circle mode _draw_circle_scene keeps drawing the stim with radius-based
-    # opacity during these ticks, so the image fades out naturally as the circle
-    # grows back above r_precue.  After the ticks, clear the stim reference.
+    # ---- Pause ticks: cross only ---------------------------------------------
     trig.send(TRIG['pause'], 'pause')
     _wait_n_ticks(P['n_pause'])
-    if P['circle_mode']:
-        _circ_extra[0] = None
-        stim.opacity   = 0.0
+
+
+def run_trial_circle(cls):
+    """
+    The circle breathes continuously: r_max → 0 → r_max in one period.
+    Period = (t_fadein + t_stay + t_fadeout + n_pause) * overlap_period seconds.
+    Sine curve keeps the motion smooth with no holds or jumps.
+
+    LSL markers fire at radius thresholds:
+      precue  — at trial start (circle begins shrinking)
+      mi      — first frame circle radius crosses r_ring inward
+      pause   — first frame circle radius crosses r_precue outward (growing back)
+
+    Image opacity ramps 0→peak as r goes r_precue→r_ring, then stays peak,
+    then ramps peak→0 as r goes r_ring→r_precue on the way back out.
+    """
+    import math as _math
+
+    peak  = P['overlay_opacity'] if P['bigpicture'] else P['circle_opacity']
+    r_max = P['circle_r_max']
+    r_pc  = P['circle_r_precue']
+    r_rg  = P['circle_r_ring']
+
+    period = (P['t_fadein'] + P['t_stay'] + P['t_fadeout'] + P['n_pause']) * overlap_period
+
+    stim = _get_stim(cls)
+    stim.opacity = 0.0
+    mi_sent    = False
+    pause_sent = False
+
+    trig.send(TRIG['precue'][cls], 'precue_%s' % cls)
+    trial_clock = core.Clock()
+
+    while True:
+        elapsed = trial_clock.getTime()
+        # sine goes 1 → -1 → 1 over one period; map to r_max → 0 → r_max
+        phase = elapsed / period          # 0→1 over one breath
+        r = r_max * 0.5 * (1.0 + _math.cos(2.0 * _math.pi * phase))
+        shrinking = phase < 0.5
+
+        # --- triggers at radius thresholds ---
+        if shrinking and r <= r_rg and not mi_sent:
+            trig.send(TRIG['mi'][cls], 'mi_%s' % cls)
+            mi_sent = True
+        if not shrinking and r >= r_pc and not pause_sent:
+            trig.send(TRIG['pause'], 'pause')
+            pause_sent = True
+
+        # --- image opacity driven by radius ---
+        if r <= r_rg:
+            stim.opacity = peak
+        elif r < r_pc:
+            t = (r_pc - r) / (r_pc - r_rg)   # 0 at r_pc, 1 at r_rg
+            gamma = P['fadein_gamma'] if shrinking else P['fadeout_gamma']
+            stim.opacity = peak * (t ** gamma)
+        else:
+            stim.opacity = 0.0
+
+        show_pic = stim.opacity > 0.01
+        draw_scene(extra=stim if show_pic else None,
+                   photodiode_on=show_pic, circle_r=r)
+        flip()
+        check_quit()
+
+        if elapsed >= period:
+            break
+
+    stim.opacity = 0.0
 
 
 def _get_stim(cls):
     """Return the image stim (or text placeholder) for a class, configured."""
-    is_big = P['bigpicture'] and not P['circle_mode']
+    is_big = P['bigpicture']
     pos = (0.0, 0.0) if is_big else SMALL_POS[cls]
     if IMG_STIMS[cls] is not None:
         stim = IMG_STIMS[cls]
@@ -529,32 +620,59 @@ def _get_stim(cls):
 
 
 # --- trial sequence --------------------------------------------------------
-def _limit_runs(seq, max_run=2):
-    for _ in range(1000):
-        ok, run = True, 1
-        for i in range(1, len(seq)):
-            if seq[i] == seq[i - 1]:
-                run += 1
-                if run > max_run:
-                    ok = False
-                    break
-            else:
-                run = 1
-        if ok:
-            return seq
-        random.shuffle(seq)
-    return seq
+def _shuffle_no_repeats(seq, forbidden_first=None):
+    """
+    Return a shuffled copy of seq with no two adjacent identical elements.
+    forbidden_first: if set, seq[0] must not equal this value (run boundary).
+    Uses a greedy approach: always pick a random element that is not the same
+    as the previous one, backtracking if stuck.
+    """
+    counts = {}
+    for x in seq:
+        counts[x] = counts.get(x, 0) + 1
+
+    result = []
+    prev = forbidden_first
+
+    def build(counts, prev):
+        if not any(counts.values()):
+            return True
+        candidates = [c for c, n in counts.items() if n > 0 and c != prev]
+        if not candidates:
+            return False
+        random.shuffle(candidates)
+        for c in candidates:
+            result.append(c)
+            counts[c] -= 1
+            if build(counts, c):
+                return True
+            result.pop()
+            counts[c] += 1
+        return False
+
+    if build(counts, prev):
+        return result
+    # fallback: plain shuffle (should never happen with 4 classes)
+    out = list(seq)
+    random.shuffle(out)
+    return out
 
 
 def make_run_sequence(prev_seq=None):
+    forbidden = prev_seq[-1] if (P['avoid_repeats'] and prev_seq) else None
     seq = CLASSES * P['n_repeats']
-    for _ in range(1000):
-        random.shuffle(seq)
-        if P['avoid_repeats']:
-            seq = _limit_runs(seq, max_run=1)
-        if seq != prev_seq:
-            return seq
-    return seq
+    if P['avoid_repeats']:
+        for _ in range(20):
+            result = _shuffle_no_repeats(seq, forbidden_first=forbidden)
+            if result != prev_seq:
+                return result
+        return _shuffle_no_repeats(seq, forbidden_first=forbidden)
+    else:
+        for _ in range(1000):
+            random.shuffle(seq)
+            if seq != prev_seq:
+                return seq
+        return seq
 
 
 # ===========================================================================
@@ -574,7 +692,7 @@ rot_cross = make_cross([0.2, 0.2, 0.2])   # darker grey
 rot_cross.ori = 0.0
 
 placeholder = visual.TextStim(win, text='', color=P['fg_color'], height=0.1, units='height')
-txt = visual.TextStim(win, text='', color=P['fg_color'], height=0.05,
+txt = visual.TextStim(win, text='', color=P['fg_color'], height=0.038,
                       wrapWidth=1.4, units='height')
 pd = visual.Rect(win, width=0.12, height=0.12, fillColor='white', lineColor='white',
                  pos=(0.78, -0.42), units='height')
@@ -610,19 +728,42 @@ else:
 #  MAIN
 # ===========================================================================
 try:
-    show_text(
-        "Motor Imagery Experiment\n\n"
-        "Keep your eyes on the cross in the centre.\n\n"
-        "When a picture appears it tells you what to imagine:\n"
-        "   REST  /  LEFT hand  /  RIGHT hand  /  FEET\n\n"
-        "After the picture disappears, imagine that movement\n"
-        "until the next picture appears.\n\n"
-        "Each trial = %d overlap ticks  (%.1f s)\n"
-        "%d trials / run,  %d runs\n\n"
-        "Press SPACE to begin."
-        % (TICKS_PER_TRIAL, TICKS_PER_TRIAL * overlap_period,
-           4 * P['n_repeats'], P['n_runs'])
-    )
+    _n_trials    = 4 * P['n_repeats']
+    _trial_s     = TICKS_PER_TRIAL * overlap_period
+    _run_s       = _n_trials * _trial_s
+    _total_s     = _run_s * P['n_runs']
+
+    def _fmt(s):
+        m, s2 = divmod(int(s), 60)
+        return '%d:%02d' % (m, s2) if m else '%ds' % s2
+
+    if P['circle_mode']:
+        _instr = (
+            "Motor Imagery Experiment\n\n"
+            "Keep your eyes on the circle in the centre.\n\n"
+            "When the circle shrinks, a picture will appear\n"
+            "showing what to imagine:\n"
+            "   REST  /  LEFT hand  /  RIGHT hand  /  FEET\n\n"
+            "Imagine the movement ONLY while the circle is within the ring.\n"
+            "Stop imagining when the circle grows back out.\n\n"
+            "Trial: %.1f s   |   Run: %s (%d trials)   |   Total: %s (%d runs)\n\n"
+            "Press SPACE to begin."
+            % (_trial_s, _fmt(_run_s), _n_trials, _fmt(_total_s), P['n_runs'])
+        )
+    else:
+        _instr = (
+            "Motor Imagery Experiment\n\n"
+            "Keep your eyes on the cross in the centre.\n\n"
+            "When a picture appears it tells you what to imagine:\n"
+            "   REST  /  LEFT hand  /  RIGHT hand  /  FEET\n\n"
+            "Start imagining at the first TICK after the picture appears.\n"
+            "Stop imagining at the next TICK.\n"
+            "One TICK = when the rotating cross aligns with the fixed cross.\n\n"
+            "Trial: %.1f s   |   Run: %s (%d trials)   |   Total: %s (%d runs)\n\n"
+            "Press SPACE to begin."
+            % (_trial_s, _fmt(_run_s), _n_trials, _fmt(_total_s), P['n_runs'])
+        )
+    show_text(_instr)
 
     # --- one-time fade-in of cross / circle over lead_in seconds ----------
     rot_cross.opacity = 0.0
@@ -652,15 +793,25 @@ try:
         prev_seq = seq[:]
 
         if run > 1:
-            show_text("Break.\n\nRun %d of %d coming up.\n\n"
-                      "Press SPACE when ready." % (run, P['n_runs']))
+            if P['circle_mode']:
+                show_text(
+                    "Break.\n\n"
+                    "Run %d of %d coming up.\n\n"
+                    "Watch the circle — imagine the movement\n"
+                    "only while the picture is visible.\n\n"
+                    "Press SPACE when ready." % (run, P['n_runs'])
+                )
+            else:
+                show_text(
+                    "Break.\n\n"
+                    "Run %d of %d coming up.\n\n"
+                    "Watch the cross — imagine the movement\n"
+                    "only while the picture is visible.\n\n"
+                    "Press SPACE when ready." % (run, P['n_runs'])
+                )
 
         globalClock.reset()
         frameClock.reset()
-        if P['circle_mode']:
-            # Offset so that globalClock.getTime() - _trial_t0[0] = 0 (→ r_max)
-            # when the cooldown finishes and trial 1 begins.
-            _trial_t0[0] = P['n_cooldown'] * overlap_period
         win.callOnFlip(trig.send, TRIG['run_start'], 'run_start')
         draw_scene()
         flip()
